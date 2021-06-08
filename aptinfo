@@ -1,0 +1,223 @@
+#!/usr/bin/env -S gawk -E
+
+@include "getopt.awk"
+
+function usage()
+{
+	print "usage: apt_info [-1Rbdflmrs] [-P PKG]"
+	exit
+}
+
+function process_options()
+{
+	if (ARGC == 1) {
+		usage()
+	}
+	show_without_fzf = 0
+	order_method = "@val_num_desc"
+	supported_sort_options = "bdflmrs"
+	supported_options = "1P:R" supported_sort_options
+	Opterr = ""
+	while ((C = getopt(ARGC, ARGV, supported_options)) != -1) {
+		C == "1" ? order_method = "@val_num_asc" :
+		C == "P" ? fzf_preview(Optarg) :
+		C == "R" ? show_without_fzf = 1 :
+		supported_sort_options ~ C ? sort_method = Optopt :
+		usage()
+	}
+}
+
+
+function which_sort_method()
+{
+	LINT = "fatal"
+	n = sort_method == "b" ? asorti(binaries, sorted, order_method)	:
+	sort_method == "d" ? asorti(dependencies, sorted, order_method) :
+	sort_method == "s" ? asorti(size, sorted, order_method) :
+	sort_method == "f" ? asorti(files, sorted, order_method) :
+	sort_method == "l" ? asorti(last_modified, sorted, order_method) :
+	sort_method == "m" ? asorti(manpages, sorted, order_method) :
+	asorti(reverse_dependencies, sorted, order_method)
+}
+
+function fzf_preview(package)
+{
+	LINT = "fatal"
+	output = ""
+	cmd = "apt show " package " 2>/dev/null"
+	system(cmd)
+
+	cmd = "dpkg-query --listfiles " package
+	while ((cmd | getline) > 0) {
+		if (/^\/data\/data\/com.termux\/files\/usr\/bin$/) {
+			output = output "\nBinaries:"
+		} else if (/^\/data\/data\/com.termux\/files\/usr\/share\/man$/) {
+			output = output "\nManpages:"
+		} else if (sub(/^\/data\/data\/com.termux\/files\/usr\/share\/man\/man[1-8]\//, "")) {
+			sub(/\..*/, "")
+			output = output " " $0
+		} else if (sub(/\/data\/data\/com.termux\/files\/usr\/bin\//, "")) {
+			output = output " " $0
+	}
+	}
+	close(cmd)
+
+	cmd = "apt-cache rdepends --important --installed "\
+					"--implicit --recurse " package
+	split("", recurse_reverse_dependencies)
+	cmd | getline
+	while((cmd | getline) > 0) {
+		if (/^Reverse Depends:$/) continue
+		sub(/^ +/, "")
+		recurse_reverse_dependencies[$0] = ""
+	}
+	close(cmd)
+	cmd = "apt-cache depends --important --installed "\
+					"--implicit --recurse " package
+	split("", recurse_dependencies)
+	cmd | getline
+	while((cmd | getline) > 0) {
+		sub(/^  Depends: /, "")
+		recurse_dependencies[$0] = ""
+	}
+	close(cmd)
+
+	array_length = length(recurse_dependencies)
+	if (array_length) {
+		output = output "\nTotal Dependencies (" array_length "): "
+		for (i in recurse_dependencies) {
+			output = output i " "
+		}
+	}
+	array_length = length(recurse_reverse_dependencies)
+	if (array_length) {
+		output = output "\nTotal Reverse Dependencies (" array_length "): "
+		for (i in recurse_reverse_dependencies) {
+			output = output i " "
+		}
+	}
+	output = output "\n"
+
+	# Unlike [[:space:]] and " ", [[:blank:]] does not match "\n".
+	split(output, arr, "[[:blank:]]")
+	termWinMaxCol = 55
+	line_length = 0
+	for (i in arr) {
+		j = arr[i]
+		line_length += length(j)
+		if (line_length >= termWinMaxCol) {
+			printf "\n  "
+			line_length = 0
+		} else if (j ~ /\n/) {
+			line_length = 0
+		}
+		printf "%s ", j
+	}
+	exit
+}
+
+BEGIN {
+	process_options()
+	LINT = "fatal"
+
+	longest_package_name = 0
+	packages = ""
+	cmd = "dpkg-query --show --showformat='${db:Status-Want}\n"\
+		"${Package}\n${Essential}\n${Installed-Size}\n"\
+		"${db-fsys:Last-Modified}\n${Depends}\n${db-fsys:Files}'"
+	while ((cmd | getline) > 0) {
+		if (/^install$/) {
+			flag = 1
+		} else if (flag == 1) {
+			package = $0
+			packages = packages " " package
+
+			package_name_length = length(package)
+			if (package_name_length > longest_package_name) {
+				longest_package_name = package_name_length
+			}
+
+			flag = 2
+		} else if (flag == 2) {
+			is_essential[package] = /^yes$/ ? 69 : 32
+			flag = 3
+		} else if (flag == 3) {
+			size[package] = sprintf("%.2f MiB", $0 / 1024)
+			flag = 4
+		} else if (flag == 4) {
+			last_modified[package] = $0
+			flag = 5
+		} else if (flag == 5) {
+			flag = 6
+			if ($0) {
+				dependencies[package] = 1
+			} else {
+				dependencies[package] = 0
+				continue
+			}
+			for (i = 1; i <= NF; ++i) {
+				if ($i ~ /,/) {
+					++dependencies[package]
+				}
+			}
+		} else if (flag == 6) {
+			manpages[package] = 0
+			binaries[package] = 0
+			files[package] = 0
+			flag = 7
+		} else if (/^deinstall$/) {
+			flag = 0
+		} else {
+			++files[package]
+			if (/\/usr\/share\/man\/man[1-8]\/[^/]+$/) {
+				++manpages[package]
+			} else if (/\/usr\/bin.*[^/]$/) {
+				++binaries[package]
+			}
+		}
+	}
+	close(cmd)
+
+	cmd = "apt-cache rdepends --important --installed" packages
+	while ((cmd | getline) > 0) {
+		if (/^ /) {
+			++reverse_dependencies[package]
+		} else if (/^</) {
+			break
+		} else if ($0 != "Reverse Depends:") {
+			package = $0
+			reverse_dependencies[package] = 0
+		}
+	}
+	close(cmd)
+
+	which_sort_method()
+
+	for (i = 1; i <= n; ++i) {
+		j = sorted[i]
+
+		output = output\
+		sprintf("%c| %.*s %-3s | %-4s | %-4s | %-5s | %-5s | %s\n",
+		is_essential[j],
+		longest_package_name,
+		j " ...........................................",
+		dependencies[j] "D",
+		reverse_dependencies[j] "R",
+		binaries[j] "B",
+		manpages[j] "M",
+		files[j] "F",
+		size[j])
+	}
+
+	if (show_without_fzf) {
+		printf "%s", output
+		exit
+	}
+
+	fzf_preview_command = "exec " ENVIRON["_"] " -P {2}"
+	fzf_command = "fzf --reverse --exact  --preview-window=down "\
+				" --preview='" fzf_preview_command "' --nth=2 "\
+				"--preview-window=down <<EOF\n"\
+				output "EOF"
+	system(fzf_command)
+}
