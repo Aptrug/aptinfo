@@ -2,58 +2,48 @@
 
 @include "getopt.awk"
 
+# Requirements:
+# * `apt` >= 0.9.9.1
+# * `dpkg` >= 1.19.3
+# * `gawk` >= 3.1
+# * `fzf` >= 0.13.0 (optional)
+
 function usage()
 {
-	print "usage: apt_info [-1Rbdflmrs] [-P PKG]"
+	OFS = "\n"
+	print "usage: apt_info [-1RUbdeflmrs] [-P PKG]",
+		  "\nsort:",
+		  "b\tbinaries",
+		  "d\tdependencies",
+		  "e\tessential",
+		  "f\tfiles",
+		  "l\tlast modification date",
+		  "m\tmanpages",
+		  "r\treverse dependencies",
+		  "s\tsize",
+		  "\nmisc:",
+		  "1\toutput reversed",
+		  "P\tshow individual package info",
+		  "U\tshow unneeded packages",
+		  "R\toutput without fzf"
 	exit
 }
 
-function process_options()
-{
-	if (ARGC == 1) {
-		usage()
-	}
-	show_without_fzf = 0
-	order_method = "@val_num_desc"
-	supported_sort_options = "bdflmrs"
-	supported_options = "1P:R" supported_sort_options
-	Opterr = ""
-	while ((C = getopt(ARGC, ARGV, supported_options)) != -1) {
-		C == "1" ? order_method = "@val_num_asc" :
-		C == "P" ? fzf_preview(Optarg) :
-		C == "R" ? show_without_fzf = 1 :
-		supported_sort_options ~ C ? sort_method = Optopt :
-		usage()
-	}
-}
-
-
-function which_sort_method()
-{
-	LINT = "fatal"
-	n = sort_method == "b" ? asorti(binaries, sorted, order_method)	:
-	sort_method == "d" ? asorti(dependencies, sorted, order_method) :
-	sort_method == "s" ? asorti(size, sorted, order_method) :
-	sort_method == "f" ? asorti(files, sorted, order_method) :
-	sort_method == "l" ? asorti(last_modified, sorted, order_method) :
-	sort_method == "m" ? asorti(manpages, sorted, order_method) :
-	asorti(reverse_dependencies, sorted, order_method)
-}
-
+# Will be run by the preview window of fzf using '-P' option
 function fzf_preview(package)
 {
-	LINT = "fatal"
 	output = ""
 	cmd = "apt show " package " 2>/dev/null"
 	system(cmd)
 
 	cmd = "dpkg-query --listfiles " package
+	manpage_regex = "^/data/data/com.termux/files/usr/share/man/man[1-8]/"
 	while ((cmd | getline) > 0) {
 		if (/^\/data\/data\/com.termux\/files\/usr\/bin$/) {
 			output = output "\nBinaries:"
 		} else if (/^\/data\/data\/com.termux\/files\/usr\/share\/man$/) {
 			output = output "\nManpages:"
-		} else if (sub(/^\/data\/data\/com.termux\/files\/usr\/share\/man\/man[1-8]\//, "")) {
+		} else if (sub(manpage_regex, "")) {
 			sub(/\..*/, "")
 			output = output " " $0
 		} else if (sub(/\/data\/data\/com.termux\/files\/usr\/bin\//, "")) {
@@ -67,7 +57,9 @@ function fzf_preview(package)
 	split("", recurse_reverse_dependencies)
 	cmd | getline
 	while((cmd | getline) > 0) {
-		if (/^Reverse Depends:$/) continue
+		if (/^Reverse Depends:$/) {
+			continue
+		}
 		sub(/^ +/, "")
 		recurse_reverse_dependencies[$0] = ""
 	}
@@ -116,9 +108,39 @@ function fzf_preview(package)
 	exit
 }
 
-BEGIN {
-	process_options()
-	LINT = "fatal"
+function process_options()
+{
+	show_without_fzf = 0
+	order_method = "@val_num_desc"
+	supported_sort_options = "bdeflmrs"
+	supported_options = "1P:RU" supported_sort_options
+	unneeded_only = 0
+	sort_method = ""
+	Opterr = ""
+	while ((C = getopt(ARGC, ARGV, supported_options)) != -1) {
+		C == "1" ? order_method = "@val_num_asc" :
+		C == "P" ? fzf_preview(Optarg) :
+		C == "R" ? show_without_fzf = 1 :
+		C == "U" ? unneeded_only = 1 :
+		supported_sort_options ~ C ? sort_method = Optopt :
+		usage()
+	}
+	# Exit if no valid sort option is provided
+	if (!(sort_method)) {
+		usage()
+	}
+}
+
+function main()
+{
+	# Array initializations
+	split("", essential)
+	split("", dependencies)
+	split("", reverse_dependencies)
+	split("", binaries)
+	split("", manpages)
+	split("", files)
+	split("", size)
 
 	longest_package_name = 0
 	packages = ""
@@ -139,7 +161,7 @@ BEGIN {
 
 			flag = 2
 		} else if (flag == 2) {
-			is_essential[package] = /^yes$/ ? 69 : 32
+			essential[package] = /^yes$/ ? 69 : 32
 			flag = 3
 		} else if (flag == 3) {
 			size[package] = sprintf("%.2f MiB", $0 / 1024)
@@ -160,14 +182,10 @@ BEGIN {
 					++dependencies[package]
 				}
 			}
-		} else if (flag == 6) {
 			manpages[package] = 0
 			binaries[package] = 0
 			files[package] = 0
-			flag = 7
-		} else if (/^deinstall$/) {
-			flag = 0
-		} else {
+		} else if (flag == 6) {
 			++files[package]
 			if (/\/usr\/share\/man\/man[1-8]\/[^/]+$/) {
 				++manpages[package]
@@ -191,14 +209,28 @@ BEGIN {
 	}
 	close(cmd)
 
-	which_sort_method()
+	n = sort_method == "b" ? asorti(binaries, sorted, order_method)	:
+	sort_method == "d" ? asorti(dependencies, sorted, order_method) :
+	sort_method == "e" ? asorti(essential, sorted, order_method) :
+	sort_method == "f" ? asorti(files, sorted, order_method) :
+	sort_method == "l" ? asorti(last_modified, sorted, order_method) :
+	sort_method == "m" ? asorti(manpages, sorted, order_method) :
+	sort_method == "r" ? asorti(reverse_dependencies, sorted, order_method) :
+	asorti(size, sorted, order_method)
 
+	output = ""
 	for (i = 1; i <= n; ++i) {
 		j = sorted[i]
 
+		# Parentheses are needed
+		if (unneeded_only && (essential[j] == 69 ||
+			reverse_dependencies[j] != 0)) {
+				continue
+		}
+
 		output = output\
 		sprintf("%c| %.*s %-3s | %-4s | %-4s | %-5s | %-5s | %s\n",
-		is_essential[j],
+		essential[j],
 		longest_package_name,
 		j " ...........................................",
 		dependencies[j] "D",
@@ -217,7 +249,37 @@ BEGIN {
 	fzf_preview_command = "exec " ENVIRON["_"] " -P {2}"
 	fzf_command = "fzf --reverse --exact  --preview-window=down "\
 				" --preview='" fzf_preview_command "' --nth=2 "\
-				"--preview-window=down <<EOF\n"\
+				"--preview-window=down --multi <<EOF\n"\
 				output "EOF"
-	system(fzf_command)
+	ERRNO = ""
+	purge_cmd = "apt purge --autoremove --"
+
+	nothing2remove= 1
+
+	if ((fzf_command | getline) > 0) {
+		purge_cmd = purge_cmd " " $2
+		nothing2remove = 0
+	}
+	while ((fzf_command | getline) > 0) {
+		purge_cmd = purge_cmd " " $2
+	}
+	fzf_command_code = close(fzf_command)
+	if (fzf_command_code == 127 || fzf_command_code == 32512) {
+		printf "%s", output
+		exit
+	}
+
+	if (nothing2remove) {
+		exit
+	}
+
+	system(purge_cmd)
 }
+
+BEGIN {
+	process_options()
+	while(1) {
+		main()
+	}
+}
+# vi:ft=awk noet
